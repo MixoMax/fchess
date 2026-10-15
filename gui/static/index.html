@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>fchess</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <header class="topbar">
+        <h1 class="wordmark">fchess</h1>
+        <p class="tagline" id="matchup">Play against the engine</p>
+    </header>
+
+    <main class="layout">
+        <section class="board-area">
+            <div class="eval-bar" id="eval-bar" aria-hidden="true">
+                <div class="eval-fill" id="eval-fill"></div>
+            </div>
+
+            <div class="board-frame">
+                <div class="board" id="board" role="grid" aria-label="Chess board"></div>
+
+                <div class="promotion hidden" id="promotion" role="dialog" aria-label="Choose promotion piece">
+                    <p>Promote to</p>
+                    <div class="promotion-options" id="promotion-options"></div>
+                </div>
+            </div>
+        </section>
+
+        <aside class="panel">
+            <div class="card status-card">
+                <p class="status" id="status">Starting…</p>
+                <p class="subtle" id="engine-info"></p>
+            </div>
+
+            <div class="card">
+                <h2 class="card-title">Evaluation</h2>
+                <p class="evaluation" id="eval-text">0.00</p>
+            </div>
+
+            <div class="card controls">
+                <label class="field">
+                    <span>Engine depth</span>
+                    <select id="depth">
+                        <option value="1">1</option>
+                        <option value="2">2</option>
+                        <option value="3">3</option>
+                        <option value="4">4</option>
+                        <option value="5">5</option>
+                        <option value="6">6</option>
+                        <option value="7" selected >7</option>
+                        <option value="8">8</option>
+                    </select>
+                </label>
+
+                <div class="button-row">
+                    <button id="btn-undo" class="btn" type="button">Undo</button>
+                    <button id="btn-flip" class="btn" type="button">Flip board</button>
+                    <button id="btn-new" class="btn btn-primary" type="button">New game</button>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2 class="card-title">Moves</h2>
+                <ol class="move-list" id="move-list"></ol>
+            </div>
+
+            <p class="error hidden" id="error" role="alert"></p>
+        </aside>
+    </main>
+
+    <div class="modal" id="start-modal" role="dialog" aria-modal="true" aria-labelledby="start-title">
+        <div class="modal-card">
+            <h2 id="start-title">New game</h2>
+            <p class="subtle">Choose your colour. White always moves first.</p>
+            <div class="color-choices">
+                <button class="choice" type="button" data-color="w">
+                    <span class="choice-glyph light-glyph">♚</span>
+                    <span>White</span>
+                </button>
+                <button class="choice" type="button" data-color="b">
+                    <span class="choice-glyph dark-glyph">♚</span>
+                    <span>Black</span>
+                </button>
+                <button class="choice" type="button" data-color="random">
+                    <span class="choice-glyph">?</span>
+                    <span>Random</span>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/app.js"></script>
+</body>
+</html>
