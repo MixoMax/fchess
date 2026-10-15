@@ -27,10 +27,12 @@ module chess_engine
   private
 
   public :: position_t, move_list_t, stats_t
-  public :: init_engine, parse_fen, gen_legal, make_move, run_perft
-  public :: move_to_uci, is_attacked, king_square
-  public :: chess_init, chess_perft, chess_legal_moves, chess_move_uci
+  public :: WHITE, BLACK, PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING
+  public :: CR_WK, CR_WQ, CR_BK, CR_BQ
   public :: MF_CAPTURE, MF_EP, MF_CASTLE, MF_PROMO_MASK
+  public :: init_engine, parse_fen, gen_legal, gen_pseudo, make_move, run_perft
+  public :: move_to_uci, is_attacked, king_square, sqbit, compute_hash, c_to_f
+  public :: chess_init, chess_perft, chess_legal_moves, chess_move_uci
 
   integer, parameter :: WHITE = 0, BLACK = 1
   integer, parameter :: PAWN = 1, KNIGHT = 2, BISHOP = 3, ROOK = 4, QUEEN = 5, KING = 6
@@ -45,6 +47,7 @@ module chess_engine
     integer(int64) :: bb(12)       ! piece bitboards, 1..6 white, 7..12 black
     integer(int64) :: occ(0:1)     ! occupancy per colour
     integer(int64) :: occ_all      ! total occupancy
+    integer(int64) :: hash = 0_int64 ! Zobrist hash key
     integer :: side = WHITE        ! side to move
     integer :: castling = 0        ! castling rights bitmask
     integer :: ep_sq = -1          ! en passant target square, -1 if none
@@ -74,6 +77,12 @@ module chess_engine
   integer(int64), save :: PAWN_ATT(0:1, 0:63)   ! PAWN_ATT(colour, sq)
   integer, save :: CASTLE_MASK(0:63)
 
+  ! Zobrist random keys, filled once by init_engine
+  integer(int64), save :: ZOBRIST_PC(12, 0:63)
+  integer(int64), save :: ZOBRIST_CASTLE(0:15)
+  integer(int64), save :: ZOBRIST_EP(0:63)
+  integer(int64), save :: ZOBRIST_SIDE
+
 contains
 
   ! ---------------------------------------------------------------------------
@@ -89,6 +98,15 @@ contains
     inboard = (f >= 0 .and. f <= 7 .and. r >= 0 .and. r <= 7)
   end function inboard
 
+  ! Deterministic 64-bit xorshift PRNG for Zobrist table initialisation
+  integer(int64) function next_rand(state)
+    integer(int64), intent(inout) :: state
+    state = ieor(state, ishft(state, 13))
+    state = ieor(state, ishft(state, -7))
+    state = ieor(state, ishft(state, 17))
+    next_rand = state
+  end function next_rand
+
   ! ---------------------------------------------------------------------------
   !  Table initialisation
   ! ---------------------------------------------------------------------------
@@ -97,7 +115,8 @@ contains
     integer, parameter :: DR(8) = [1, 0, 1, 1, -1, 0, -1, -1]
     integer, parameter :: KDF(8) = [1, 2, 2, 1, -1, -2, -2, -1]
     integer, parameter :: KDR(8) = [2, 1, -1, -2, -2, -1, 1, 2]
-    integer :: sq, f, r, d, k, nf, nr
+    integer :: sq, f, r, d, k, nf, nr, pc
+    integer(int64) :: seed
 
     if (initialised) return
 
@@ -149,8 +168,43 @@ contains
       end do
     end do
 
+    ! Zobrist random keys (fixed seed for reproducible hashes)
+    seed = 1070372_int64
+    do sq = 0, 63
+      do pc = 1, 12
+        ZOBRIST_PC(pc, sq) = next_rand(seed)
+      end do
+      ZOBRIST_EP(sq) = next_rand(seed)
+    end do
+    do k = 0, 15
+      ZOBRIST_CASTLE(k) = next_rand(seed)
+    end do
+    ZOBRIST_SIDE = next_rand(seed)
+
     initialised = .true.
   end subroutine init_engine
+
+  ! ---------------------------------------------------------------------------
+  !  Zobrist hash computation from scratch
+  ! ---------------------------------------------------------------------------
+  pure integer(int64) function compute_hash(p) result(h)
+    type(position_t), intent(in) :: p
+    integer :: pc, sq
+    integer(int64) :: b
+
+    h = 0_int64
+    do pc = 1, 12
+      b = p%bb(pc)
+      do while (b /= 0_int64)
+        sq = trailz(b)
+        b = iand(b, b - 1_int64)
+        h = ieor(h, ZOBRIST_PC(pc, sq))
+      end do
+    end do
+    h = ieor(h, ZOBRIST_CASTLE(iand(p%castling, 15)))
+    if (p%ep_sq >= 0) h = ieor(h, ZOBRIST_EP(p%ep_sq))
+    if (p%side == BLACK) h = ieor(h, ZOBRIST_SIDE)
+  end function compute_hash
 
   ! ---------------------------------------------------------------------------
   !  Sliding attacks using ray tables and the nearest blocker
@@ -204,14 +258,14 @@ contains
     p%occ_all = ior(p%occ(0), p%occ(1))
   end subroutine update_occ
 
-  integer function king_square(p, side)
+  pure integer function king_square(p, side)
     type(position_t), intent(in) :: p
     integer, intent(in) :: side
     king_square = trailz(p%bb(6*side + KING))
   end function king_square
 
   ! True if square sq is attacked by any piece of colour 'by'
-  logical function is_attacked(p, sq, by)
+  pure logical function is_attacked(p, sq, by)
     type(position_t), intent(in) :: p
     integer, intent(in) :: sq, by
     integer :: o
@@ -279,8 +333,11 @@ contains
     integer :: n, i, rank, file, sq, idx, ios
     character(len=1) :: ch
 
+    call init_engine()
+
     ok = .false.
     p%bb = 0_int64
+    p%hash = 0_int64
     p%side = WHITE
     p%castling = 0
     p%ep_sq = -1
@@ -348,6 +405,7 @@ contains
     end if
 
     call update_occ(p)
+    p%hash = compute_hash(p)
     ok = .true.
   end subroutine parse_fen
 
@@ -543,10 +601,11 @@ contains
     integer(int32), intent(in) :: m
     type(position_t) :: np
     integer :: from, to, us, them, ou, ot, pc, k, promo, cap_sq, rf, rt
-    integer(int64) :: fb, tb
+    integer(int64) :: fb, tb, h
     logical :: is_cap, is_ep, is_castle
 
     np = p
+    h = p%hash
     from = iand(m, 63)
     to = iand(ishft(m, -6), 63)
     promo = iand(ishft(m, -12), 7)
@@ -560,6 +619,10 @@ contains
     is_ep = iand(m, MF_EP) /= 0
     is_castle = iand(m, MF_CASTLE) /= 0
 
+    ! Remove previous en passant and castling keys from hash
+    if (p%ep_sq >= 0) h = ieor(h, ZOBRIST_EP(p%ep_sq))
+    h = ieor(h, ZOBRIST_CASTLE(iand(p%castling, 15)))
+
     ! Identify and remove the moving piece
     pc = 0
     do k = 1, 6
@@ -569,15 +632,18 @@ contains
       end if
     end do
     np%bb(ou + pc) = ieor(np%bb(ou + pc), fb)
+    h = ieor(h, ZOBRIST_PC(ou + pc, from))
 
     ! Remove the captured piece
     if (is_ep) then
       cap_sq = to - 8 + 16*us
       np%bb(ot + PAWN) = ieor(np%bb(ot + PAWN), sqbit(cap_sq))
+      h = ieor(h, ZOBRIST_PC(ot + PAWN, cap_sq))
     else if (is_cap) then
       do k = 1, 6
         if (iand(p%bb(ot + k), tb) /= 0_int64) then
           np%bb(ot + k) = ieor(np%bb(ot + k), tb)
+          h = ieor(h, ZOBRIST_PC(ot + k, to))
           exit
         end if
       end do
@@ -586,8 +652,10 @@ contains
     ! Place the moving (or promoted) piece
     if (promo /= 0) then
       np%bb(ou + promo) = ior(np%bb(ou + promo), tb)
+      h = ieor(h, ZOBRIST_PC(ou + promo, to))
     else
       np%bb(ou + pc) = ior(np%bb(ou + pc), tb)
+      h = ieor(h, ZOBRIST_PC(ou + pc, to))
     end if
 
     ! Move the rook for castling
@@ -600,15 +668,20 @@ contains
         rt = to + 1
       end if
       np%bb(ou + ROOK) = ieor(np%bb(ou + ROOK), ior(sqbit(rf), sqbit(rt)))
+      h = ieor(h, ieor(ZOBRIST_PC(ou + ROOK, rf), ZOBRIST_PC(ou + ROOK, rt)))
     end if
 
     ! Update castling rights, en passant square, and clocks
     np%castling = iand(np%castling, iand(CASTLE_MASK(from), CASTLE_MASK(to)))
+    h = ieor(h, ZOBRIST_CASTLE(iand(np%castling, 15)))
+
     if (pc == PAWN .and. abs(to - from) == 16) then
       np%ep_sq = (from + to) / 2
+      h = ieor(h, ZOBRIST_EP(np%ep_sq))
     else
       np%ep_sq = -1
     end if
+
     if (pc == PAWN .or. is_cap) then
       np%halfmove = 0
     else
@@ -617,6 +690,8 @@ contains
     if (us == BLACK) np%fullmove = p%fullmove + 1
 
     np%side = them
+    h = ieor(h, ZOBRIST_SIDE)
+    np%hash = h
     call update_occ(np)
   end function make_move
 
