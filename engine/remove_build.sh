@@ -1,2 +1,2 @@
-rm bin/{libchess.so,perft,search}
+rm bin/{libfchess.so,perft,search}
 rm *.mod

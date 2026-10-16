@@ -37,7 +37,7 @@ module chess_search_mod
   integer, parameter :: TT_BETA  = 3  ! lower bound (failed high)
 
   ! Transposition table size: 2^20 entries (~24 MB)
-  integer, parameter :: TT_BITS = 20
+  integer, parameter :: TT_BITS = 24
   integer, parameter :: TT_SIZE = ishft(1, TT_BITS)
   integer(int64), parameter :: TT_MASK = int(TT_SIZE - 1, int64)
 
@@ -127,9 +127,7 @@ module chess_search_mod
 
 contains
 
-  ! ---------------------------------------------------------------------------
   !  Initialise evaluation tables and transposition table
-  ! ---------------------------------------------------------------------------
   subroutine init_search()
     integer :: sq, w_idx, b_idx
 
@@ -169,9 +167,7 @@ contains
     TT%flag  = TT_NONE
   end subroutine clear_tt
 
-  ! ---------------------------------------------------------------------------
   !  Static Evaluation (returns score in centipawns from p%side's perspective)
-  ! ---------------------------------------------------------------------------
   pure integer function evaluate(p) result(score)
     type(position_t), intent(in) :: p
     integer :: pc, sq, w_score, b_score
@@ -204,9 +200,7 @@ contains
     end if
   end function evaluate
 
-  ! ---------------------------------------------------------------------------
   !  Transposition Table Probe and Store
-  ! ---------------------------------------------------------------------------
   subroutine tt_probe(key, depth, ply, alpha, beta, hit, score, tt_move)
     integer(int64), intent(in) :: key
     integer, intent(in) :: depth, ply, alpha, beta
@@ -261,9 +255,7 @@ contains
     TT(idx)%flag  = int(flag, int32)
   end subroutine tt_store
 
-  ! ---------------------------------------------------------------------------
   !  Move Ordering Helpers (TT move first + MVV-LVA + Promotions)
-  ! ---------------------------------------------------------------------------
   pure integer function piece_type_at(p, side, sq) result(pt)
     type(position_t), intent(in) :: p
     integer, intent(in) :: side, sq
@@ -345,9 +337,7 @@ contains
     end if
   end subroutine pick_move
 
-  ! ---------------------------------------------------------------------------
   !  Quiescence Search (resolves tactical captures/promotions at leaf nodes)
-  ! ---------------------------------------------------------------------------
   recursive integer function quiescence(p, alpha_in, beta, ply, nodes) result(best_score)
     type(position_t), intent(in) :: p
     integer, intent(in) :: alpha_in, beta, ply
@@ -419,9 +409,7 @@ contains
     end if
   end function quiescence
 
-  ! ---------------------------------------------------------------------------
   !  Negamax Alpha-Beta Search
-  ! ---------------------------------------------------------------------------
   recursive integer function negamax(p, depth, alpha_in, beta, ply, nodes, best_move_out) result(best_score)
     type(position_t), intent(in) :: p
     integer, intent(in) :: depth, alpha_in, beta, ply
@@ -507,9 +495,7 @@ contains
     call tt_store(p%hash, depth, ply, best_score, tt_flag, best_move_out)
   end function negamax
 
-  ! ---------------------------------------------------------------------------
   !  Top-level iterative deepening search driver
-  ! ---------------------------------------------------------------------------
   subroutine search_position(p, max_depth, info)
     type(position_t), intent(in) :: p
     integer, intent(in) :: max_depth
@@ -539,9 +525,7 @@ contains
     end do
   end subroutine search_position
 
-  ! ---------------------------------------------------------------------------
   !  C API bindings for shared library (.so) usage
-  ! ---------------------------------------------------------------------------
 
   ! Clear the transposition table
   subroutine chess_clear_tt_c() bind(C, name="chess_clear_tt")

@@ -33,15 +33,16 @@ module chess_engine
   public :: init_engine, parse_fen, gen_legal, gen_pseudo, make_move, run_perft
   public :: move_to_uci, is_attacked, king_square, sqbit, compute_hash, c_to_f
   public :: chess_init, chess_perft, chess_legal_moves, chess_move_uci
+  public :: chess_make_move, chess_in_check
 
   integer, parameter :: WHITE = 0, BLACK = 1
   integer, parameter :: PAWN = 1, KNIGHT = 2, BISHOP = 3, ROOK = 4, QUEEN = 5, KING = 6
   integer, parameter :: CR_WK = 1, CR_WQ = 2, CR_BK = 4, CR_BQ = 8
 
-  integer, parameter :: MF_CAPTURE = 32768     ! bit 15
-  integer, parameter :: MF_EP = 65536          ! bit 16
-  integer, parameter :: MF_CASTLE = 131072     ! bit 17
-  integer, parameter :: MF_PROMO_MASK = 28672  ! bits 12..14
+  integer, parameter :: MF_CAPTURE = 32768     ! bit 15       (binary: 001000000000000000)
+  integer, parameter :: MF_EP = 65536          ! bit 16       (binary: 010000000000000000)
+  integer, parameter :: MF_CASTLE = 131072     ! bit 17       (binary: 100000000000000000)
+  integer, parameter :: MF_PROMO_MASK = 28672  ! bits 12..14  (binary: 000111000000000000)
 
   type :: position_t
     integer(int64) :: bb(12)       ! piece bitboards, 1..6 white, 7..12 black
@@ -84,18 +85,15 @@ module chess_engine
   integer(int64), save :: ZOBRIST_SIDE
 
 contains
-
-  ! ---------------------------------------------------------------------------
-  !  Small helpers
-  ! ---------------------------------------------------------------------------
   pure integer(int64) function sqbit(sq)
     integer, intent(in) :: sq
     sqbit = ishft(1_int64, sq)
   end function sqbit
 
+  ! check if f and r are within the board (0..7)
   pure logical function inboard(f, r)
     integer, intent(in) :: f, r
-    inboard = (f >= 0 .and. f <= 7 .and. r >= 0 .and. r <= 7)
+    inboard = iand(ior(f, r), not(7)) == 0
   end function inboard
 
   ! Deterministic 64-bit xorshift PRNG for Zobrist table initialisation
@@ -107,9 +105,7 @@ contains
     next_rand = state
   end function next_rand
 
-  ! ---------------------------------------------------------------------------
-  !  Table initialisation
-  ! ---------------------------------------------------------------------------
+  ! init tables
   subroutine init_engine()
     integer, parameter :: DF(8) = [0, 1, 1, -1, 0, -1, 1, -1]
     integer, parameter :: DR(8) = [1, 0, 1, 1, -1, 0, -1, -1]
@@ -322,9 +318,7 @@ contains
     end do
   end subroutine split_tokens
 
-  ! ---------------------------------------------------------------------------
-  !  FEN parsing
-  ! ---------------------------------------------------------------------------
+
   subroutine parse_fen(fen, p, ok)
     character(len=*), intent(in) :: fen
     type(position_t), intent(out) :: p
@@ -409,9 +403,6 @@ contains
     ok = .true.
   end subroutine parse_fen
 
-  ! ---------------------------------------------------------------------------
-  !  Move encoding helpers
-  ! ---------------------------------------------------------------------------
   subroutine add_move(ml, from, to, flags, promo)
     type(move_list_t), intent(inout) :: ml
     integer, intent(in) :: from, to, flags, promo
@@ -452,9 +443,7 @@ contains
     end do
   end subroutine add_targets
 
-  ! ---------------------------------------------------------------------------
   !  Castling (king and rook must be in place, path empty, and no attacks)
-  ! ---------------------------------------------------------------------------
   subroutine gen_castles(p, ml)
     type(position_t), intent(in) :: p
     type(move_list_t), intent(inout) :: ml
@@ -496,9 +485,7 @@ contains
     end if
   end subroutine gen_castles
 
-  ! ---------------------------------------------------------------------------
   !  Pseudo-legal move generation
-  ! ---------------------------------------------------------------------------
   recursive subroutine gen_pseudo(p, ml)
     type(position_t), intent(in) :: p
     type(move_list_t), intent(inout) :: ml
@@ -593,9 +580,8 @@ contains
     if (p%castling /= 0) call gen_castles(p, ml)
   end subroutine gen_pseudo
 
-  ! ---------------------------------------------------------------------------
-  !  Make a move (returns a new position; the input is untouched)
-  ! ---------------------------------------------------------------------------
+
+  !  Make a move (does not operate in place, returns a new position)
   function make_move(p, m) result(np)
     type(position_t), intent(in) :: p
     integer(int32), intent(in) :: m
@@ -695,9 +681,7 @@ contains
     call update_occ(np)
   end function make_move
 
-  ! ---------------------------------------------------------------------------
   !  Legal move generation: pseudo-legal moves filtered by king safety
-  ! ---------------------------------------------------------------------------
   recursive subroutine gen_legal(p, ml)
     type(position_t), intent(in) :: p
     type(move_list_t), intent(out) :: ml
@@ -717,9 +701,7 @@ contains
     end do
   end subroutine gen_legal
 
-  ! ---------------------------------------------------------------------------
   !  Perft with statistics on the final ply
-  ! ---------------------------------------------------------------------------
   recursive subroutine perft(p, depth, st)
     type(position_t), intent(in) :: p
     integer, intent(in) :: depth
@@ -762,9 +744,7 @@ contains
     end if
   end subroutine run_perft
 
-  ! ---------------------------------------------------------------------------
   !  UCI move string, e.g. "e2e4", "e7e8q"
-  ! ---------------------------------------------------------------------------
   pure function move_to_uci(m) result(s)
     integer(int32), intent(in) :: m
     character(len=5) :: s
@@ -785,9 +765,76 @@ contains
     end select
   end function move_to_uci
 
-  ! ---------------------------------------------------------------------------
+    !  Serialise a position to a FEN string
+  subroutine position_to_fen(p, fen)
+    type(position_t), intent(in) :: p
+    character(len=:), allocatable, intent(out) :: fen
+    character(len=*), parameter :: PCHARS = 'PNBRQKpnbrqk'
+    character(len=:), allocatable :: s
+    character(len=8) :: num
+    integer :: r, f, k, pc, empty
+    integer(int64) :: bit
+
+    s = ''
+    do r = 7, 0, -1
+      empty = 0
+      do f = 0, 7
+        bit = sqbit(8*r + f)
+        pc = 0
+        do k = 1, 12
+          if (iand(p%bb(k), bit) /= 0_int64) then
+            pc = k
+            exit
+          end if
+        end do
+        if (pc == 0) then
+          empty = empty + 1
+        else
+          if (empty > 0) then
+            write (num, '(i0)') empty
+            s = s//trim(num)
+            empty = 0
+          end if
+          s = s//PCHARS(pc:pc)
+        end if
+      end do
+      if (empty > 0) then
+        write (num, '(i0)') empty
+        s = s//trim(num)
+      end if
+      if (r > 0) s = s//'/'
+    end do
+
+    if (p%side == WHITE) then
+      s = s//' w '
+    else
+      s = s//' b '
+    end if
+
+    if (p%castling == 0) then
+      s = s//'-'
+    else
+      if (iand(p%castling, CR_WK) /= 0) s = s//'K'
+      if (iand(p%castling, CR_WQ) /= 0) s = s//'Q'
+      if (iand(p%castling, CR_BK) /= 0) s = s//'k'
+      if (iand(p%castling, CR_BQ) /= 0) s = s//'q'
+    end if
+
+    if (p%ep_sq < 0) then
+      s = s//' - '
+    else
+      s = s//' '//achar(ichar('a') + modulo(p%ep_sq, 8)) &
+                //achar(ichar('1') + p%ep_sq/8)//' '
+    end if
+
+    write (num, '(i0)') p%halfmove
+    s = s//trim(num)//' '
+    write (num, '(i0)') p%fullmove
+    s = s//trim(num)
+    fen = s
+  end subroutine position_to_fen
+
   !  C interface helpers
-  ! ---------------------------------------------------------------------------
   function c_to_f(cs) result(fs)
     character(kind=c_char), dimension(*), intent(in) :: cs
     character(len=:), allocatable :: fs
@@ -867,5 +914,72 @@ contains
     end do
     buf(n + 1) = c_null_char
   end subroutine chess_move_uci
+
+  ! Play a legal move (encoded as returned by chess_legal_moves) and write the
+  ! resulting FEN into out_fen (NUL-terminated, capacity out_len).
+  ! Returns 0 on success, -1 invalid FEN, -2 move not legal, -3 buffer too small.
+  integer(c_int) function chess_make_move(fen, move, out_fen, out_len) bind(C, name="chess_make_move")
+    character(kind=c_char), dimension(*), intent(in) :: fen
+    integer(c_int32_t), value, intent(in) :: move
+    character(kind=c_char), dimension(*), intent(out) :: out_fen
+    integer(c_int), value, intent(in) :: out_len
+    type(position_t) :: p, np
+    type(move_list_t) :: ml
+    character(len=:), allocatable :: s
+    logical :: ok, found
+    integer :: i, n
+
+    call init_engine()
+    call parse_fen(c_to_f(fen), p, ok)
+    if (.not. ok) then
+      chess_make_move = -1_c_int
+      return
+    end if
+
+    call gen_legal(p, ml)
+    found = .false.
+    do i = 1, ml%n
+      if (ml%m(i) == int(move, int32)) then
+        found = .true.
+        exit
+      end if
+    end do
+    if (.not. found) then
+      chess_make_move = -2_c_int
+      return
+    end if
+
+    np = make_move(p, int(move, int32))
+    call position_to_fen(np, s)
+    n = len(s)
+    if (n + 1 > int(out_len)) then
+      chess_make_move = -3_c_int
+      return
+    end if
+    do i = 1, n
+      out_fen(i) = s(i:i)
+    end do
+    out_fen(n + 1) = c_null_char
+    chess_make_move = 0_c_int
+  end function chess_make_move
+
+  ! 1 if the side to move is in check, 0 if not, -1 on invalid FEN.
+  integer(c_int) function chess_in_check(fen) bind(C, name="chess_in_check")
+    character(kind=c_char), dimension(*), intent(in) :: fen
+    type(position_t) :: p
+    logical :: ok
+
+    call init_engine()
+    call parse_fen(c_to_f(fen), p, ok)
+    if (.not. ok .or. p%bb(6*p%side + KING) == 0_int64) then
+      chess_in_check = -1_c_int
+      return
+    end if
+    if (is_attacked(p, king_square(p, p%side), 1 - p%side)) then
+      chess_in_check = 1_c_int
+    else
+      chess_in_check = 0_c_int
+    end if
+  end function chess_in_check
 
 end module chess_engine

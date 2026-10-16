@@ -5,9 +5,14 @@ program perft_main
   character(len=1024) :: arg, fen_buf
   type(position_t) :: p
   type(stats_t) :: st
+  type(stats_t) :: default_expected_stats
+  logical :: is_using_default_fen_str
+  logical :: expected_stats_match
   logical :: ok
   real :: t0, t1, nps, scaled_nps
   character(len=16) :: unit_prefix
+
+  is_using_default_fen_str = .false.
 
   nargs = command_argument_count()
   if (nargs < 1) then
@@ -24,6 +29,15 @@ program perft_main
 
   if (nargs == 1) then
     fen_buf = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1'
+    if (depth == 5) then
+      is_using_default_fen_str = .true.
+      default_expected_stats%nodes = 4865609
+      default_expected_stats%captures = 82719
+      default_expected_stats%ep = 258
+      default_expected_stats%castles = 0
+      default_expected_stats%promotions = 0
+      default_expected_stats%checks = 27351
+    end if
   else
     fen_buf = ''
     do i = 1, nargs - 1
@@ -69,6 +83,32 @@ program perft_main
   end if
 
   write (*, '(a,f10.3,1x,a)') 'Nodes/s:     ', scaled_nps, trim(unit_prefix)
+
+  if (is_using_default_fen_str) then
+    expected_stats_match = .true.
+    if (st%nodes /= default_expected_stats%nodes .or. &
+        st%captures /= default_expected_stats%captures .or. &
+        st%ep /= default_expected_stats%ep .or. &
+        st%castles /= default_expected_stats%castles .or. &
+        st%promotions /= default_expected_stats%promotions .or. &
+        st%checks /= default_expected_stats%checks) then
+      expected_stats_match = .false.
+    end if
+
+    if (.not. expected_stats_match) then
+      write (*, '(a)') 'Error: Perft results do not match expected values for the default starting position.'
+      write (*, '(a,a)') 'Expected Nodes:       ', trim(format_commas(default_expected_stats%nodes))
+      write (*, '(a,a)') 'Expected Captures:    ', trim(format_commas(default_expected_stats%captures))
+      write (*, '(a,a)') 'Expected En passant:  ', trim(format_commas(default_expected_stats%ep))
+      write (*, '(a,a)') 'Expected Castles:     ', trim(format_commas(default_expected_stats%castles))
+      write (*, '(a,a)') 'Expected Promotions:  ', trim(format_commas(default_expected_stats%promotions))
+      write (*, '(a,a)') 'Expected Checks:      ', trim(format_commas(default_expected_stats%checks))
+    end if
+
+    if (expected_stats_match) then
+      write (*, '(a)') 'Perft results VERIFIED'
+    end if
+  end if
 
 contains
 

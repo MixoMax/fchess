@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.realpath(os.path.join(HERE, "static"))
-LIB_PATH = os.path.join(HERE, "..", "engine", "bin", "libchess.so")
+LIB_PATH = os.path.join(HERE, "..", "engine", "bin", "libfchess.so")
 
 SEARCH_DEPTH = 7
 MAX_MOVES = 512           # matches move_list_t capacity in the engine
