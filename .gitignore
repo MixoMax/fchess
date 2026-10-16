@@ -1,2 +1,6 @@
 *.pyc
 *digest.txt
+*.mod
+engine/bin/perft
+engine/bin/search
+*.so

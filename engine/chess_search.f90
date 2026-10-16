@@ -1,537 +1,759 @@
 ! =============================================================================
 !  chess_search.f90
-!  Evaluation, Transposition Table, and Alpha-Beta Search (Fortran 2008)
+!  Search for the Fortran chess engine (Fortran 2008 + OpenMP)
 !
 !  Features
-!    * Static evaluation combining piece values (P=100, N=300, B=300, R=500,
-!      Q=1000) and standard piece-square positional tables (PST).
-!    * Zobrist-hashed transposition table (TT) with mate-score ply adjustment.
-!    * Move ordering: TT hash move first, then MVV-LVA + promotion bonuses.
-!    * Negamax alpha-beta search with iterative deepening and quiescence search.
-!    * ISO_C_BINDING interface for shared library (.so) interoperability.
+!    * Negamax principal variation search (PVS) with iterative deepening
+!      and aspiration windows at the root.
+!    * Lock-free, shared transposition table (Lazy SMP). Each entry is stored
+!      as two int64 words: key = hash XOR data, data = packed entry. A torn
+!      read from a concurrent write fails the check and is treated as a miss.
+!    * Null-move pruning, late move reductions, razoring, futility pruning,
+!      check extensions, mate-distance pruning.
+!    * Quiescence search with delta pruning.
+!    * Move ordering: TT move, MVV-LVA captures, promotions, killers, history.
+!    * Incremental static evaluation (position_t%score).
+!
+!  Lazy SMP: every thread runs iterative deepening on the same root. Helper
+!  threads skip some iteration depths and perturb root move ordering so their
+!  TT writes differ. The main thread (thread 0) returns the result. When it
+!  finishes, it sets a global stop flag that makes the helpers unwind.
 ! =============================================================================
 module chess_search_mod
   use, intrinsic :: iso_fortran_env, only: int32, int64
   use, intrinsic :: iso_c_binding
+  use omp_lib
   use chess_engine
   implicit none
   private
 
   public :: search_info_t
-  public :: init_search, clear_tt, evaluate, search_position
-  public :: chess_search_c, chess_eval_c, chess_clear_tt_c
-  public :: MATE_SCORE, INF_SCORE
+  public :: init_search, clear_tt, evaluate, search_position, set_num_threads
+  public :: chess_search_c, chess_eval_c, chess_clear_tt_c, chess_set_threads_c
+  public :: MATE_SCORE, MATE_THRESHOLD, INF_SCORE
 
-  integer, parameter :: INF_SCORE  = 30000
+  integer, parameter :: INF_SCORE = 30000
   integer, parameter :: MATE_SCORE = 29000
   integer, parameter :: MATE_THRESHOLD = 28000
-  integer, parameter :: MAX_PLY    = 128
+  integer, parameter :: MAX_PLY = 128
 
-  ! Piece values in centipawns: P=100, N=300, B=300, R=500, Q=1000, K=0
-  integer, parameter :: PIECE_VAL(6) = [100, 300, 300, 500, 1000, 0]
-
-  ! Transposition table bound types
-  integer, parameter :: TT_NONE  = 0
-  integer, parameter :: TT_EXACT = 1
-  integer, parameter :: TT_ALPHA = 2  ! upper bound (failed low)
-  integer, parameter :: TT_BETA  = 3  ! lower bound (failed high)
-
-  ! Transposition table size: 2^20 entries (~24 MB)
+  ! Transposition table: 2^24 entries (2 x 128 MB)
   integer, parameter :: TT_BITS = 24
   integer, parameter :: TT_SIZE = ishft(1, TT_BITS)
   integer(int64), parameter :: TT_MASK = int(TT_SIZE - 1, int64)
+  integer(int64), parameter :: MOVE_MASK = 262143_int64   ! 18 bits
 
-  type :: tt_entry_t
-    integer(int64) :: key   = 0_int64
-    integer(int32) :: move  = 0_int32
-    integer(int32) :: score = 0_int32
-    integer(int32) :: depth = -1_int32
-    integer(int32) :: flag  = TT_NONE
-  end type tt_entry_t
+  integer, parameter :: TT_NONE = 0, TT_EXACT = 1, TT_ALPHA = 2, TT_BETA = 3
+
+  ! Search tuning
+  integer, parameter :: RAZOR_DEPTH = 3, RAZOR_BASE = 300, RAZOR_STEP = 150
+  integer, parameter :: NULL_MIN_DEPTH = 3, NULL_R_BASE = 3
+  integer, parameter :: FUT_DEPTH = 4, FUT_STEP = 150
+  integer, parameter :: DELTA_MARGIN = 200
+  integer, parameter :: LMR_MIN_DEPTH = 3, LMR_MIN_MOVE = 4
+  integer, parameter :: ASP_MIN_DEPTH = 5, ASP_WINDOW = 40
+  integer, parameter :: HIST_MAX = 16384
+
+  integer(int64), allocatable, save :: tt_key(:), tt_dat(:)
+  integer, save :: LMR_TAB(0:MAX_PLY, 0:MAX_MOVES - 1)
+  logical, save :: search_initialised = .false.
+  integer, save :: g_num_threads = 0       ! 0 = OpenMP default
+  integer, save :: g_stop = 0              ! shared stop flag for Lazy SMP
 
   type :: search_info_t
     integer(int32) :: best_move = 0_int32
-    integer(int32) :: score     = 0_int32
-    integer(int64) :: nodes     = 0_int64
-    integer        :: depth     = 0
+    integer(int32) :: score = 0_int32
+    integer(int64) :: nodes = 0_int64
+    integer :: depth = 0
   end type search_info_t
 
-  ! Pre-combined material + positional table: EVAL_TABLE(piece_idx 1..12, sq 0..63)
-  logical, save :: search_initialised = .false.
-  integer, save :: EVAL_TABLE(12, 0:63)
-  type(tt_entry_t), save :: TT(0:TT_SIZE - 1)
-
-  ! ---------------------------------------------------------------------------
-  !  Piece-Square Tables from White's perspective (rank 8 down to rank 1,
-  !  files a..h on each row). Visual top row is a8..h8, bottom row is a1..h1.
-  ! ---------------------------------------------------------------------------
-  integer, parameter :: PST_PAWN(0:63) = [ &
-     0,   0,   0,   0,   0,   0,   0,   0, &
-    50,  50,  50,  50,  50,  50,  50,  50, &
-    10,  10,  20,  30,  30,  20,  10,  10, &
-     5,   5,  10,  25,  25,  10,   5,   5, &
-     0,   0,   0,  20,  20,   0,   0,   0, &
-     5,  -5, -10,   0,   0, -10,  -5,   5, &
-     5,  10,  10, -20, -20,  10,  10,   5, &
-     0,   0,   0,   0,   0,   0,   0,   0  ]
-
-  integer, parameter :: PST_KNIGHT(0:63) = [ &
-   -50, -40, -30, -30, -30, -30, -40, -50, &
-   -40, -20,   0,   0,   0,   0, -20, -40, &
-   -30,   0,  10,  15,  15,  10,   0, -30, &
-   -30,   5,  15,  20,  20,  15,   5, -30, &
-   -30,   0,  15,  20,  20,  15,   0, -30, &
-   -30,   5,  10,  15,  15,  10,   5, -30, &
-   -40, -20,   0,   5,   5,   0, -20, -40, &
-   -50, -40, -30, -30, -30, -30, -40, -50  ]
-
-  integer, parameter :: PST_BISHOP(0:63) = [ &
-   -20, -10, -10, -10, -10, -10, -10, -20, &
-   -10,   0,   0,   0,   0,   0,   0, -10, &
-   -10,   0,   5,  10,  10,   5,   0, -10, &
-   -10,   5,   5,  10,  10,   5,   5, -10, &
-   -10,   0,  10,  10,  10,  10,   0, -10, &
-   -10,  10,  10,  10,  10,  10,  10, -10, &
-   -10,   5,   0,   0,   0,   0,   5, -10, &
-   -20, -10, -10, -10, -10, -10, -10, -20  ]
-
-  integer, parameter :: PST_ROOK(0:63) = [ &
-     0,   0,   0,   0,   0,   0,   0,   0, &
-     5,  10,  10,  10,  10,  10,  10,   5, &
-    -5,   0,   0,   0,   0,   0,   0,  -5, &
-    -5,   0,   0,   0,   0,   0,   0,  -5, &
-    -5,   0,   0,   0,   0,   0,   0,  -5, &
-    -5,   0,   0,   0,   0,   0,   0,  -5, &
-    -5,   0,   0,   0,   0,   0,   0,  -5, &
-     0,   0,   0,   5,   5,   0,   0,   0  ]
-
-  integer, parameter :: PST_QUEEN(0:63) = [ &
-   -20, -10, -10,  -5,  -5, -10, -10, -20, &
-   -10,   0,   0,   0,   0,   0,   0, -10, &
-   -10,   0,   5,   5,   5,   5,   0, -10, &
-    -5,   0,   5,   5,   5,   5,   0,  -5, &
-     0,   0,   5,   5,   5,   5,   0,  -5, &
-   -10,   5,   5,   5,   5,   5,   0, -10, &
-   -10,   0,   5,   0,   0,   0,   0, -10, &
-   -20, -10, -10,  -5,  -5, -10, -10, -20  ]
-
-  integer, parameter :: PST_KING(0:63) = [ &
-   -30, -40, -40, -50, -50, -40, -40, -30, &
-   -30, -40, -40, -50, -50, -40, -40, -30, &
-   -30, -40, -40, -50, -50, -40, -40, -30, &
-   -30, -40, -40, -50, -50, -40, -40, -30, &
-   -20, -30, -30, -40, -40, -30, -30, -20, &
-   -10, -20, -20, -20, -20, -20, -20, -10, &
-    20,  20,   0,   0,   0,   0,  20,  20, &
-    20,  30,  10,   0,   0,  10,  30,  20  ]
+  type :: thread_ctx_t
+    integer :: tid = 0
+    integer(int64) :: nodes = 0_int64
+    logical :: aborted = .false.
+    integer(int32), allocatable :: mv(:, :)        ! move list per ply
+    integer(int32), allocatable :: sc(:, :)        ! move scores per ply
+    integer(int32) :: killers(2, 0:MAX_PLY) = 0_int32
+    integer(int32), allocatable :: history(:, :, :)
+  end type thread_ctx_t
 
 contains
 
-  !  Initialise evaluation tables and transposition table
+  ! ---------------------------------------------------------------------------
+  !  Shared stop flag
+  ! ---------------------------------------------------------------------------
+  logical function stop_requested()
+    integer :: s
+    !$omp atomic read
+    s = g_stop
+    stop_requested = (s /= 0)
+  end function stop_requested
+
+  subroutine set_stop(v)
+    integer, intent(in) :: v
+    !$omp atomic write
+    g_stop = v
+  end subroutine set_stop
+
+  integer function effective_threads()
+    if (g_num_threads > 0) then
+      effective_threads = g_num_threads
+    else
+      effective_threads = omp_get_max_threads()
+    end if
+  end function effective_threads
+
+  subroutine set_num_threads(n)
+    integer, intent(in) :: n
+    g_num_threads = n
+  end subroutine set_num_threads
+
+  ! ---------------------------------------------------------------------------
+  !  Initialisation
+  ! ---------------------------------------------------------------------------
   subroutine init_search()
-    integer :: sq, w_idx, b_idx
+    integer :: d, k
 
     if (search_initialised) return
     call init_engine()
 
-    do sq = 0, 63
-      ! Map engine square (a1=0..h8=63) to visual PST index (a8=0..h1=63)
-      w_idx = ieor(sq, 56)
-      ! Black mirrors vertically relative to White (a1=0..h8=63)
-      b_idx = sq
+    if (.not. allocated(tt_key)) then
+      allocate (tt_key(0:TT_SIZE - 1), tt_dat(0:TT_SIZE - 1))
+    end if
+    tt_key = 0_int64
+    tt_dat = 0_int64
 
-      EVAL_TABLE(PAWN,   sq) = PIECE_VAL(PAWN)   + PST_PAWN(w_idx)
-      EVAL_TABLE(KNIGHT, sq) = PIECE_VAL(KNIGHT) + PST_KNIGHT(w_idx)
-      EVAL_TABLE(BISHOP, sq) = PIECE_VAL(BISHOP) + PST_BISHOP(w_idx)
-      EVAL_TABLE(ROOK,   sq) = PIECE_VAL(ROOK)   + PST_ROOK(w_idx)
-      EVAL_TABLE(QUEEN,  sq) = PIECE_VAL(QUEEN)  + PST_QUEEN(w_idx)
-      EVAL_TABLE(KING,   sq) = PIECE_VAL(KING)   + PST_KING(w_idx)
-
-      EVAL_TABLE(6 + PAWN,   sq) = PIECE_VAL(PAWN)   + PST_PAWN(b_idx)
-      EVAL_TABLE(6 + KNIGHT, sq) = PIECE_VAL(KNIGHT) + PST_KNIGHT(b_idx)
-      EVAL_TABLE(6 + BISHOP, sq) = PIECE_VAL(BISHOP) + PST_BISHOP(b_idx)
-      EVAL_TABLE(6 + ROOK,   sq) = PIECE_VAL(ROOK)   + PST_ROOK(b_idx)
-      EVAL_TABLE(6 + QUEEN,  sq) = PIECE_VAL(QUEEN)  + PST_QUEEN(b_idx)
-      EVAL_TABLE(6 + KING,   sq) = PIECE_VAL(KING)   + PST_KING(b_idx)
+    do d = 0, MAX_PLY
+      do k = 0, MAX_MOVES - 1
+        if (d == 0 .or. k == 0) then
+          LMR_TAB(d, k) = 0
+        else
+          LMR_TAB(d, k) = int(0.75 + log(real(d)) * log(real(k)) / 2.25)
+        end if
+      end do
     end do
 
-    call clear_tt()
     search_initialised = .true.
   end subroutine init_search
 
   subroutine clear_tt()
-    TT%key   = 0_int64
-    TT%move  = 0_int32
-    TT%score = 0_int32
-    TT%depth = -1_int32
-    TT%flag  = TT_NONE
+    if (allocated(tt_key)) then
+      tt_key = 0_int64
+      tt_dat = 0_int64
+    end if
   end subroutine clear_tt
 
-  !  Static Evaluation (returns score in centipawns from p%side's perspective)
-  pure integer function evaluate(p) result(score)
+  pure integer function evaluate(p)
     type(position_t), intent(in) :: p
-    integer :: pc, sq, w_score, b_score
-    integer(int64) :: b
-
-    w_score = 0
-    do pc = 1, 6
-      b = p%bb(pc)
-      do while (b /= 0_int64)
-        sq = trailz(b)
-        b = iand(b, b - 1_int64)
-        w_score = w_score + EVAL_TABLE(pc, sq)
-      end do
-    end do
-
-    b_score = 0
-    do pc = 7, 12
-      b = p%bb(pc)
-      do while (b /= 0_int64)
-        sq = trailz(b)
-        b = iand(b, b - 1_int64)
-        b_score = b_score + EVAL_TABLE(pc, sq)
-      end do
-    end do
-
-    if (p%side == WHITE) then
-      score = w_score - b_score
-    else
-      score = b_score - w_score
-    end if
+    evaluate = static_eval(p)
   end function evaluate
 
-  !  Transposition Table Probe and Store
-  subroutine tt_probe(key, depth, ply, alpha, beta, hit, score, tt_move)
-    integer(int64), intent(in) :: key
-    integer, intent(in) :: depth, ply, alpha, beta
-    logical, intent(out) :: hit
-    integer, intent(out) :: score
-    integer(int32), intent(out) :: tt_move
-    integer(int64) :: idx
+  ! ---------------------------------------------------------------------------
+  !  Transposition table (lock-free, XOR-verified)
+  !  data layout: bits 0..17 move, 18..33 score+32768, 34..41 depth, 42..43 flag
+  ! ---------------------------------------------------------------------------
+  subroutine tt_probe(hash, ply, found, t_depth, t_flag, t_score, t_move)
+    integer(int64), intent(in) :: hash
+    integer, intent(in) :: ply
+    logical, intent(out) :: found
+    integer, intent(out) :: t_depth, t_flag, t_score
+    integer(int32), intent(out) :: t_move
+    integer(int64) :: idx, k, d
     integer :: s
 
-    hit = .false.
-    score = 0
-    tt_move = 0_int32
-    idx = iand(key, TT_MASK)
+    found = .false.
+    t_depth = -1
+    t_flag = TT_NONE
+    t_score = 0
+    t_move = 0_int32
 
-    if (TT(idx)%flag /= TT_NONE .and. TT(idx)%key == key) then
-      tt_move = TT(idx)%move
-      if (TT(idx)%depth >= depth) then
-        s = int(TT(idx)%score)
-        if (s > MATE_THRESHOLD) s = s - ply
-        if (s < -MATE_THRESHOLD) s = s + ply
+    idx = iand(hash, TT_MASK)
+    k = tt_key(idx)
+    d = tt_dat(idx)
+    if (ieor(k, d) /= hash) return
 
-        if (TT(idx)%flag == TT_EXACT) then
-          score = s
-          hit = .true.
-        else if (TT(idx)%flag == TT_ALPHA .and. s <= alpha) then
-          score = alpha
-          hit = .true.
-        else if (TT(idx)%flag == TT_BETA .and. s >= beta) then
-          score = beta
-          hit = .true.
-        end if
-      end if
+    t_flag = int(iand(ishft(d, -42), 3_int64))
+    if (t_flag == TT_NONE) return
+
+    found = .true.
+    t_move = int(iand(d, MOVE_MASK), int32)
+    t_depth = int(iand(ishft(d, -34), 255_int64))
+    s = int(iand(ishft(d, -18), 65535_int64)) - 32768
+    if (s > MATE_THRESHOLD) then
+      s = s - ply
+    else if (s < -MATE_THRESHOLD) then
+      s = s + ply
     end if
+    t_score = s
   end subroutine tt_probe
 
-  subroutine tt_store(key, depth, ply, score, flag, move)
-    integer(int64), intent(in) :: key
+  subroutine tt_store(hash, depth, ply, score, flag, move)
+    integer(int64), intent(in) :: hash
     integer, intent(in) :: depth, ply, score, flag
     integer(int32), intent(in) :: move
-    integer(int64) :: idx
-    integer :: s
+    integer(int64) :: idx, d_old, d_new
+    integer :: s, dep, old_depth
+    integer(int32) :: mv
+    logical :: same
 
-    idx = iand(key, TT_MASK)
-    s = score
+    idx = iand(hash, TT_MASK)
+    d_old = tt_dat(idx)
+    same = (ieor(tt_key(idx), d_old) == hash)
+    dep = min(max(depth, 0), 255)
+    mv = move
+
+    if (same) then
+      old_depth = int(iand(ishft(d_old, -34), 255_int64))
+      if (dep < old_depth) return                  ! keep the deeper entry
+      if (mv == 0_int32) mv = int(iand(d_old, MOVE_MASK), int32)
+    end if
+
+    s = max(-32000, min(32000, score))
     if (s > MATE_THRESHOLD) s = s + ply
     if (s < -MATE_THRESHOLD) s = s - ply
 
-    TT(idx)%key   = key
-    if (move /= 0_int32 .or. TT(idx)%key /= key) TT(idx)%move = move
-    TT(idx)%score = int(s, int32)
-    TT(idx)%depth = int(depth, int32)
-    TT(idx)%flag  = int(flag, int32)
+    d_new = iand(int(mv, int64), MOVE_MASK)
+    d_new = ior(d_new, ishft(int(s + 32768, int64), 18))
+    d_new = ior(d_new, ishft(int(dep, int64), 34))
+    d_new = ior(d_new, ishft(int(flag, int64), 42))
+
+    tt_dat(idx) = d_new
+    tt_key(idx) = ieor(hash, d_new)
   end subroutine tt_store
 
-  !  Move Ordering Helpers (TT move first + MVV-LVA + Promotions)
-  pure integer function piece_type_at(p, side, sq) result(pt)
-    type(position_t), intent(in) :: p
-    integer, intent(in) :: side, sq
-    integer :: o, k
-    integer(int64) :: b
-    o = 6*side
-    b = sqbit(sq)
-    pt = 0
-    do k = 1, 6
-      if (iand(p%bb(o + k), b) /= 0_int64) then
-        pt = k
-        return
-      end if
-    end do
-  end function piece_type_at
+  ! ---------------------------------------------------------------------------
+  !  Move ordering
+  ! ---------------------------------------------------------------------------
+  pure subroutine hist_update(h, us, from, to, bonus)
+    integer(int32), intent(inout) :: h(0:1, 0:63, 0:63)
+    integer, intent(in) :: us, from, to, bonus
+    integer(int32) :: cur
+    cur = h(us, from, to)
+    h(us, from, to) = cur + bonus - (cur * abs(bonus)) / HIST_MAX
+  end subroutine hist_update
 
-  subroutine score_moves(p, ml, tt_move, scores)
+  subroutine score_moves(p, mv, sc, n, tt_move, k1, k2, hist, us)
     type(position_t), intent(in) :: p
-    type(move_list_t), intent(in) :: ml
-    integer(int32), intent(in) :: tt_move
-    integer, intent(out) :: scores(:)
-    integer :: i, m, from, to, promo, attacker, victim
+    integer(int32), intent(in) :: mv(:)
+    integer(int32), intent(inout) :: sc(:)
+    integer, intent(in) :: n, us
+    integer(int32), intent(in) :: tt_move, k1, k2
+    integer(int32), intent(in) :: hist(0:1, 0:63, 0:63)
+    integer :: i, from, to, promo, att, vic
+    integer(int32) :: m
 
-    do i = 1, ml%n
-      m = ml%m(i)
-      if (m == tt_move .and. tt_move /= 0_int32) then
-        scores(i) = 1000000
+    do i = 1, n
+      m = mv(i)
+      from = iand(m, 63)
+      to = iand(ishft(m, -6), 63)
+      promo = iand(ishft(m, -12), 7)
+
+      if (tt_move /= 0_int32 .and. m == tt_move) then
+        sc(i) = 3000000
+      else if (iand(m, MF_CAPTURE) /= 0) then
+        att = piece_type_of(int(p%piece_on(from)))
+        if (iand(m, MF_EP) /= 0) then
+          vic = PAWN
+        else
+          vic = piece_type_of(int(p%piece_on(to)))
+        end if
+        sc(i) = 1000000 + 10*PIECE_VAL(vic) - PIECE_VAL(att)
+        if (promo /= 0) sc(i) = sc(i) + PIECE_VAL(promo)
+      else if (promo /= 0) then
+        sc(i) = 1500000 + PIECE_VAL(promo)
+      else if (m == k1) then
+        sc(i) = 900000
+      else if (m == k2) then
+        sc(i) = 890000
       else
-        scores(i) = 0
-        from  = iand(m, 63)
-        to    = iand(ishft(m, -6), 63)
-        promo = iand(ishft(m, -12), 7)
-
-        if (iand(m, MF_CAPTURE) /= 0) then
-          attacker = piece_type_at(p, p%side, from)
-          if (iand(m, MF_EP) /= 0) then
-            victim = PAWN
-          else
-            victim = piece_type_at(p, 1 - p%side, to)
-          end if
-          if (victim > 0 .and. attacker > 0) then
-            scores(i) = 100000 + 10 * PIECE_VAL(victim) - PIECE_VAL(attacker) / 100
-          else
-            scores(i) = 100000
-          end if
-        end if
-
-        if (promo /= 0) then
-          scores(i) = scores(i) + 50000 + PIECE_VAL(promo)
-        end if
+        sc(i) = hist(us, from, to)
       end if
     end do
   end subroutine score_moves
 
-  ! Selection-sort step: brings the highest-scoring remaining move to index 'idx'
-  subroutine pick_move(ml, scores, idx)
-    type(move_list_t), intent(inout) :: ml
-    integer, intent(inout) :: scores(:)
-    integer, intent(in) :: idx
-    integer :: j, best_idx, best_s
-    integer(int32) :: tmp_m
+  ! Root move noise for Lazy SMP helper threads
+  subroutine diversify_root(mv, sc, n, tid)
+    integer(int32), intent(in) :: mv(:)
+    integer(int32), intent(inout) :: sc(:)
+    integer, intent(in) :: n, tid
+    integer :: i
+    integer(int64) :: noise
+    do i = 1, n
+      noise = mod(int(mv(i), int64) * 2654435761_int64 + int(tid, int64) * 40503_int64, 997_int64)
+      sc(i) = sc(i) + int(noise, int32)
+    end do
+  end subroutine diversify_root
+
+  ! Selection step: bring the best remaining move to position idx
+  subroutine pick_move(mv, sc, n, idx)
+    integer(int32), intent(inout) :: mv(:)
+    integer(int32), intent(inout) :: sc(:)
+    integer, intent(in) :: n, idx
+    integer :: j, best_idx
+    integer(int32) :: best_s, tmp_s, tmp_m
 
     best_idx = idx
-    best_s = scores(idx)
-    do j = idx + 1, ml%n
-      if (scores(j) > best_s) then
-        best_s = scores(j)
+    best_s = sc(idx)
+    do j = idx + 1, n
+      if (sc(j) > best_s) then
+        best_s = sc(j)
         best_idx = j
       end if
     end do
 
     if (best_idx /= idx) then
-      tmp_m = ml%m(idx)
-      ml%m(idx) = ml%m(best_idx)
-      ml%m(best_idx) = tmp_m
-
-      scores(best_idx) = scores(idx)
-      scores(idx) = best_s
+      tmp_m = mv(idx)
+      mv(idx) = mv(best_idx)
+      mv(best_idx) = tmp_m
+      tmp_s = sc(idx)
+      sc(idx) = sc(best_idx)
+      sc(best_idx) = tmp_s
     end if
   end subroutine pick_move
 
-  !  Quiescence Search (resolves tactical captures/promotions at leaf nodes)
-  recursive integer function quiescence(p, alpha_in, beta, ply, nodes) result(best_score)
-    type(position_t), intent(in) :: p
+  ! ---------------------------------------------------------------------------
+  !  Quiescence search (captures and promotions; all evasions when in check)
+  ! ---------------------------------------------------------------------------
+  recursive integer function qsearch(p, alpha_in, beta, ply, ctx) result(best)
+    type(position_t), intent(inout) :: p
     integer, intent(in) :: alpha_in, beta, ply
-    integer(int64), intent(inout) :: nodes
-    type(move_list_t) :: pl, ml
-    type(position_t) :: np
-    integer :: scores(512)
-    integer :: alpha, stand_pat, score, i, legal_moves
+    type(thread_ctx_t), intent(inout) :: ctx
+    integer :: alpha, stand, score, i, n, legal, us, victim, to
     integer(int32) :: m
-    logical :: in_check
+    logical :: in_check, is_cap, is_promo
+    type(undo_t) :: u
 
-    nodes = nodes + 1_int64
+    ctx%nodes = ctx%nodes + 1_int64
+    if (iand(ctx%nodes, 2047_int64) == 0_int64) then
+      if (stop_requested()) ctx%aborted = .true.
+    end if
+    if (ctx%aborted) then
+      best = 0
+      return
+    end if
+    if (ply >= MAX_PLY) then
+      best = static_eval(p)
+      return
+    end if
+
+    us = p%side
     alpha = alpha_in
+    in_check = is_attacked(p, king_square(p, us), 1 - us)
+    stand = -INF_SCORE
+
+    if (in_check) then
+      best = -INF_SCORE
+    else
+      stand = static_eval(p)
+      if (stand >= beta) then
+        best = stand
+        return
+      end if
+      if (stand > alpha) alpha = stand
+      best = stand
+    end if
+
+    n = 0
+    call gen_pseudo_arr(p, ctx%mv(:, ply), n)
+    call score_moves(p, ctx%mv(:, ply), ctx%sc(:, ply), n, 0_int32, 0_int32, 0_int32, &
+                     ctx%history, us)
+
+    legal = 0
+    do i = 1, n
+      call pick_move(ctx%mv(:, ply), ctx%sc(:, ply), n, i)
+      m = ctx%mv(i, ply)
+      is_cap = iand(m, MF_CAPTURE) /= 0
+      is_promo = iand(m, MF_PROMO_MASK) /= 0
+
+      ! Captures and promotions are sorted first; quiet moves end the list
+      ! when we are not in check.
+      if (.not. in_check .and. .not. is_cap .and. .not. is_promo) exit
+
+      to = iand(ishft(m, -6), 63)
+      if (.not. in_check .and. .not. is_promo) then
+        if (iand(m, MF_EP) /= 0) then
+          victim = PIECE_VAL(PAWN)
+        else
+          victim = PIECE_VAL(piece_type_of(int(p%piece_on(to))))
+        end if
+        if (stand + victim + DELTA_MARGIN <= alpha) cycle
+      end if
+
+      call do_move(p, m, u)
+      if (is_attacked(p, king_square(p, us), 1 - us)) then
+        call undo_move(p, m, u)
+        cycle
+      end if
+      legal = legal + 1
+
+      score = -qsearch(p, -beta, -alpha, ply + 1, ctx)
+      call undo_move(p, m, u)
+
+      if (ctx%aborted) then
+        best = 0
+        return
+      end if
+
+      if (score > best) then
+        best = score
+        if (score > alpha) then
+          alpha = score
+          if (alpha >= beta) return
+        end if
+      end if
+    end do
+
+    if (in_check .and. legal == 0) best = -MATE_SCORE + ply
+  end function qsearch
+
+  ! ---------------------------------------------------------------------------
+  !  Negamax PVS with pruning and reductions
+  ! ---------------------------------------------------------------------------
+  recursive integer function negamax(p, depth, alpha_in, beta_in, ply, ctx, allow_null, best_out) &
+      result(best)
+    type(position_t), intent(inout) :: p
+    integer, intent(in) :: depth, alpha_in, beta_in, ply
+    type(thread_ctx_t), intent(inout) :: ctx
+    logical, intent(in) :: allow_null
+    integer(int32), intent(out) :: best_out
+
+    integer :: alpha, bta, orig_alpha, sev, fut_margin, n, legal, us, them
+    integer :: i, j, r, newd, ext, score, bonus, from, to, flag
+    integer :: t_depth, t_flag, t_score
+    integer(int32) :: tt_move, m, best_m, dummy_m, mj
+    logical :: found, in_check, pv, fut, is_cap, is_promo, quiet, gives
+    type(undo_t) :: u
+
+    best = -INF_SCORE
+    best_out = 0_int32
+    dummy_m = 0_int32
+
+    ctx%nodes = ctx%nodes + 1_int64
+    if (iand(ctx%nodes, 2047_int64) == 0_int64) then
+      if (stop_requested()) ctx%aborted = .true.
+    end if
+    if (ctx%aborted) then
+      best = 0
+      return
+    end if
 
     if (ply >= MAX_PLY) then
-      best_score = evaluate(p)
+      best = static_eval(p)
       return
     end if
 
-    in_check = is_attacked(p, king_square(p, p%side), 1 - p%side)
-
-    if (.not. in_check) then
-      stand_pat = evaluate(p)
-      if (stand_pat >= beta) then
-        best_score = beta
-        return
-      end if
-      if (stand_pat > alpha) alpha = stand_pat
-      best_score = stand_pat
-    else
-      best_score = -INF_SCORE
-    end if
-
-    pl%n = 0
-    call gen_pseudo(p, pl)
-
-    ! Filter moves: if in check, try all evasions; otherwise only captures & promotions
-    ml%n = 0
-    do i = 1, pl%n
-      m = pl%m(i)
-      if (in_check .or. iand(m, MF_CAPTURE) /= 0 .or. iand(m, MF_PROMO_MASK) /= 0) then
-        ml%n = ml%n + 1
-        ml%m(ml%n) = m
-      end if
-    end do
-
-    call score_moves(p, ml, 0_int32, scores)
-
-    legal_moves = 0
-    do i = 1, ml%n
-      call pick_move(ml, scores, i)
-      m = ml%m(i)
-      np = make_move(p, m)
-      if (is_attacked(np, king_square(np, p%side), np%side)) cycle
-      legal_moves = legal_moves + 1
-
-      score = -quiescence(np, -beta, -alpha, ply + 1, nodes)
-
-      if (score >= beta) then
-        best_score = beta
-        return
-      end if
-      if (score > best_score) best_score = score
-      if (score > alpha) alpha = score
-    end do
-
-    if (in_check .and. legal_moves == 0) then
-      best_score = -MATE_SCORE + ply
-    end if
-  end function quiescence
-
-  !  Negamax Alpha-Beta Search
-  recursive integer function negamax(p, depth, alpha_in, beta, ply, nodes, best_move_out) result(best_score)
-    type(position_t), intent(in) :: p
-    integer, intent(in) :: depth, alpha_in, beta, ply
-    integer(int64), intent(inout) :: nodes
-    integer(int32), intent(out) :: best_move_out
-    type(move_list_t) :: pl
-    type(position_t) :: np
-    integer :: scores(512)
-    integer :: alpha, score, i, legal_moves, tt_flag
-    integer(int32) :: tt_move, m
-    logical :: tt_hit, in_check
-
-    best_move_out = 0_int32
-
-    ! Fifty-move rule draw check (above root)
-    if (ply > 0 .and. p%halfmove >= 100) then
-      best_score = 0
-      return
-    end if
-
-    ! Probe transposition table
-    call tt_probe(p%hash, depth, ply, alpha_in, beta, tt_hit, score, tt_move)
-    if (ply > 0 .and. tt_hit) then
-      best_score = score
-      best_move_out = tt_move
-      return
-    end if
-
-    ! Base case: drop into quiescence search
-    if (depth <= 0 .or. ply >= MAX_PLY) then
-      best_score = quiescence(p, alpha_in, beta, ply, nodes)
-      return
-    end if
-
-    nodes = nodes + 1_int64
+    us = p%side
+    them = 1 - us
     alpha = alpha_in
-    best_score = -INF_SCORE
-    legal_moves = 0
+    bta = beta_in
 
-    pl%n = 0
-    call gen_pseudo(p, pl)
-    call score_moves(p, pl, tt_move, scores)
-
-    do i = 1, pl%n
-      call pick_move(pl, scores, i)
-      m = pl%m(i)
-      np = make_move(p, m)
-      if (is_attacked(np, king_square(np, p%side), np%side)) cycle
-      legal_moves = legal_moves + 1
-
-      if (best_move_out == 0_int32) best_move_out = m
-
-      score = -negamax(np, depth - 1, -beta, -alpha, ply + 1, nodes, m)
-
-      if (score > best_score) then
-        best_score = score
-        best_move_out = pl%m(i)
+    if (ply > 0) then
+      if (p%halfmove >= 100) then
+        best = 0
+        return
       end if
-
-      if (score > alpha) alpha = score
-      if (alpha >= beta) exit
-    end do
-
-    ! Checkmate or stalemate detection
-    if (legal_moves == 0) then
-      in_check = is_attacked(p, king_square(p, p%side), 1 - p%side)
-      if (in_check) then
-        best_score = -MATE_SCORE + ply
-      else
-        best_score = 0
+      ! Mate-distance pruning
+      alpha = max(alpha, -MATE_SCORE + ply)
+      bta = min(bta, MATE_SCORE - ply - 1)
+      if (alpha >= bta) then
+        best = alpha
+        return
       end if
+    end if
+
+    orig_alpha = alpha
+    pv = (bta - alpha) > 1
+    in_check = is_attacked(p, king_square(p, us), them)
+
+    ! Transposition table
+    call tt_probe(p%hash, ply, found, t_depth, t_flag, t_score, tt_move)
+    if (found .and. ply > 0 .and. .not. pv .and. t_depth >= depth) then
+      if (t_flag == TT_EXACT .or. (t_flag == TT_ALPHA .and. t_score <= alpha) &
+          .or. (t_flag == TT_BETA .and. t_score >= bta)) then
+        best = t_score
+        return
+      end if
+    end if
+
+    if (depth <= 0) then
+      best = qsearch(p, alpha, bta, ply, ctx)
       return
     end if
 
-    ! Store result in transposition table
-    if (best_score <= alpha_in) then
-      tt_flag = TT_ALPHA
-    else if (best_score >= beta) then
-      tt_flag = TT_BETA
-    else
-      tt_flag = TT_EXACT
+    sev = 0
+    if (.not. in_check) sev = static_eval(p)
+
+    if (ply > 0 .and. .not. pv .and. .not. in_check) then
+      ! Razoring
+      if (depth <= RAZOR_DEPTH .and. sev + RAZOR_BASE + RAZOR_STEP*depth <= alpha) then
+        score = qsearch(p, alpha, alpha + 1, ply, ctx)
+        if (ctx%aborted) then
+          best = 0
+          return
+        end if
+        if (score <= alpha) then
+          best = score
+          return
+        end if
+      end if
+
+      ! Null-move pruning
+      if (allow_null .and. depth >= NULL_MIN_DEPTH .and. sev >= bta .and. has_non_pawns(p, us)) then
+        r = NULL_R_BASE + depth / 4
+        call do_null(p, u)
+        score = -negamax(p, depth - 1 - r, -bta, -bta + 1, ply + 1, ctx, .false., dummy_m)
+        call undo_null(p, u)
+        if (ctx%aborted) then
+          best = 0
+          return
+        end if
+        if (score >= bta) then
+          if (score >= MATE_THRESHOLD) then
+            best = bta
+          else
+            best = score
+          end if
+          return
+        end if
+      end if
     end if
-    call tt_store(p%hash, depth, ply, best_score, tt_flag, best_move_out)
+
+    fut = (ply > 0 .and. .not. pv .and. .not. in_check .and. depth <= FUT_DEPTH .and. &
+           abs(alpha) < MATE_THRESHOLD)
+    fut_margin = FUT_STEP * depth
+
+    ! Move generation and ordering
+    n = 0
+    call gen_pseudo_arr(p, ctx%mv(:, ply), n)
+    call score_moves(p, ctx%mv(:, ply), ctx%sc(:, ply), n, tt_move, &
+                     ctx%killers(1, ply), ctx%killers(2, ply), ctx%history, us)
+    if (ply == 0 .and. ctx%tid > 0) then
+      call diversify_root(ctx%mv(:, ply), ctx%sc(:, ply), n, ctx%tid)
+    end if
+
+    legal = 0
+    best_m = 0_int32
+
+    do i = 1, n
+      call pick_move(ctx%mv(:, ply), ctx%sc(:, ply), n, i)
+      m = ctx%mv(i, ply)
+      is_cap = iand(m, MF_CAPTURE) /= 0
+      is_promo = iand(m, MF_PROMO_MASK) /= 0
+      quiet = .not. (is_cap .or. is_promo)
+      from = iand(m, 63)
+      to = iand(ishft(m, -6), 63)
+
+      call do_move(p, m, u)
+      if (is_attacked(p, king_square(p, us), them)) then
+        call undo_move(p, m, u)
+        cycle
+      end if
+      legal = legal + 1
+      gives = is_attacked(p, king_square(p, them), us)
+
+      ! Futility pruning for quiet moves
+      if (fut .and. quiet .and. .not. gives .and. legal > 1 .and. sev + fut_margin <= alpha) then
+        call undo_move(p, m, u)
+        cycle
+      end if
+
+      ext = 0
+      if (gives) ext = 1
+      newd = depth - 1 + ext
+
+      if (legal == 1) then
+        score = -negamax(p, newd, -bta, -alpha, ply + 1, ctx, .true., dummy_m)
+      else
+        ! Late move reductions
+        r = 0
+        if (depth >= LMR_MIN_DEPTH .and. legal >= LMR_MIN_MOVE .and. quiet .and. &
+            .not. in_check .and. .not. gives) then
+          r = LMR_TAB(min(depth, MAX_PLY), min(legal, MAX_MOVES - 1))
+          if (m == ctx%killers(1, ply) .or. m == ctx%killers(2, ply)) r = r - 1
+          r = max(0, min(r, newd - 1))
+        end if
+
+        score = -negamax(p, newd - r, -alpha - 1, -alpha, ply + 1, ctx, .true., dummy_m)
+        if (score > alpha .and. r > 0) then
+          score = -negamax(p, newd, -alpha - 1, -alpha, ply + 1, ctx, .true., dummy_m)
+        end if
+        if (score > alpha .and. score < bta) then
+          score = -negamax(p, newd, -bta, -alpha, ply + 1, ctx, .true., dummy_m)
+        end if
+      end if
+
+      call undo_move(p, m, u)
+      if (ctx%aborted) then
+        best = 0
+        return
+      end if
+
+      if (score > best) then
+        best = score
+        best_m = m
+        if (score > alpha) then
+          alpha = score
+          if (alpha >= bta) then
+            if (quiet) then
+              bonus = min(depth*depth, 400)
+              if (m /= ctx%killers(1, ply)) then
+                ctx%killers(2, ply) = ctx%killers(1, ply)
+                ctx%killers(1, ply) = m
+              end if
+              call hist_update(ctx%history, us, from, to, bonus)
+              ! Penalise quiet moves that were searched before the cutoff move
+              do j = 1, i - 1
+                mj = ctx%mv(j, ply)
+                if (iand(mj, MF_CAPTURE) == 0 .and. iand(mj, MF_PROMO_MASK) == 0 .and. mj /= m) then
+                  call hist_update(ctx%history, us, iand(mj, 63), iand(ishft(mj, -6), 63), -bonus)
+                end if
+              end do
+            end if
+            exit
+          end if
+        end if
+      end if
+    end do
+
+    if (legal == 0) then
+      if (in_check) then
+        best = -MATE_SCORE + ply
+      else
+        best = 0
+      end if
+      best_out = 0_int32
+      return
+    end if
+
+    best_out = best_m
+
+    if (best <= orig_alpha) then
+      flag = TT_ALPHA
+    else if (best >= bta) then
+      flag = TT_BETA
+    else
+      flag = TT_EXACT
+    end if
+    call tt_store(p%hash, depth, ply, best, flag, best_m)
   end function negamax
 
-  !  Top-level iterative deepening search driver
+  ! ---------------------------------------------------------------------------
+  !  Per-thread search state
+  ! ---------------------------------------------------------------------------
+  subroutine init_ctx(ctx, tid)
+    type(thread_ctx_t), intent(out) :: ctx
+    integer, intent(in) :: tid
+
+    allocate (ctx%mv(MAX_MOVES, 0:MAX_PLY))
+    allocate (ctx%sc(MAX_MOVES, 0:MAX_PLY))
+    allocate (ctx%history(0:1, 0:63, 0:63))
+    ctx%mv = 0_int32
+    ctx%sc = 0_int32
+    ctx%history = 0_int32
+    ctx%killers = 0_int32
+    ctx%tid = tid
+    ctx%nodes = 0_int64
+    ctx%aborted = .false.
+  end subroutine init_ctx
+
+  ! Iterative deepening for one thread
+  subroutine thread_iterate(p0, max_depth, tid, out)
+    type(position_t), intent(in) :: p0
+    integer, intent(in) :: max_depth, tid
+    type(search_info_t), intent(inout) :: out
+    type(position_t) :: root
+    type(thread_ctx_t) :: ctx
+    integer :: d, alpha, beta, score, prev
+    integer(int32) :: bm
+
+    root = p0
+    call init_ctx(ctx, tid)
+
+    out%best_move = 0_int32
+    out%score = 0_int32
+    out%depth = 0
+    prev = 0
+    bm = 0_int32
+    score = 0
+
+    do d = 1, max_depth
+      ! Helpers skip some depths so their TT contents differ from the main thread
+      if (tid > 0 .and. d < max_depth .and. mod(d + tid, 3) == 0) cycle
+
+      if (d >= ASP_MIN_DEPTH .and. out%depth > 0) then
+        alpha = prev - ASP_WINDOW
+        beta = prev + ASP_WINDOW
+      else
+        alpha = -INF_SCORE
+        beta = INF_SCORE
+      end if
+
+      do
+        score = negamax(root, d, alpha, beta, 0, ctx, .true., bm)
+        if (ctx%aborted) exit
+        if (score <= alpha .and. alpha > -INF_SCORE) then
+          alpha = -INF_SCORE
+        else if (score >= beta .and. beta < INF_SCORE) then
+          beta = INF_SCORE
+        else
+          exit
+        end if
+      end do
+
+      if (ctx%aborted) exit
+      if (bm /= 0_int32) out%best_move = bm
+      out%score = int(score, int32)
+      out%depth = d
+      prev = score
+    end do
+
+    out%nodes = ctx%nodes
+    if (tid == 0) call set_stop(1)
+  end subroutine thread_iterate
+
+  ! ---------------------------------------------------------------------------
+  !  Public driver: Lazy SMP over OpenMP threads
+  ! ---------------------------------------------------------------------------
   subroutine search_position(p, max_depth, info)
     type(position_t), intent(in) :: p
     integer, intent(in) :: max_depth
     type(search_info_t), intent(out) :: info
-    type(move_list_t) :: ml
-    integer :: d, target_depth, score
-    integer(int32) :: iter_move
+    type(search_info_t), allocatable :: res(:)
+    integer :: nt, t, md
+    integer(int64) :: total
 
     call init_search()
+    md = max(1, max_depth)
+    nt = effective_threads()
+    allocate (res(0:nt - 1))
+    call set_stop(0)
 
-    info%best_move = 0_int32
-    info%score     = 0_int32
-    info%nodes     = 0_int64
-    target_depth   = max(1, max_depth)
-    info%depth     = target_depth
+!$omp parallel num_threads(nt) default(shared) private(t)
+    t = omp_get_thread_num()
+    call thread_iterate(p, md, t, res(t))
+!$omp end parallel
 
-    ! Fallback legal move in case search terminates early
-    call gen_legal(p, ml)
-    if (ml%n == 0) return
-    info%best_move = ml%m(1)
-
-    ! Iterative deepening populates the TT and refines move ordering
-    do d = 1, target_depth
-      score = negamax(p, d, -INF_SCORE, INF_SCORE, 0, info%nodes, iter_move)
-      if (iter_move /= 0_int32) info%best_move = iter_move
-      info%score = int(score, int32)
+    total = 0_int64
+    do t = 0, nt - 1
+      total = total + res(t)%nodes
     end do
+
+    info = res(0)
+    info%nodes = total
   end subroutine search_position
 
-  !  C API bindings for shared library (.so) usage
-
-  ! Clear the transposition table
+  ! ---------------------------------------------------------------------------
+  !  C API
+  ! ---------------------------------------------------------------------------
   subroutine chess_clear_tt_c() bind(C, name="chess_clear_tt")
     call init_search()
     call clear_tt()
   end subroutine chess_clear_tt_c
+
+  subroutine chess_set_threads_c(n) bind(C, name="chess_set_threads")
+    integer(c_int), value, intent(in) :: n
+    call set_num_threads(int(n))
+  end subroutine chess_set_threads_c
 
   ! Static evaluation of a FEN string from the side-to-move's perspective.
   ! Returns 0 on success, -1 on invalid FEN.
@@ -548,13 +770,11 @@ contains
       chess_eval_c = -1_c_int
       return
     end if
-    score = int(evaluate(p), c_int32_t)
+    score = int(static_eval(p), c_int32_t)
     chess_eval_c = 0_c_int
   end function chess_eval_c
 
-  ! Search a FEN position up to fixed depth.
-  ! Outputs: best_move (encoded int32, 0 if no legal moves), score (centipawns
-  ! from side to move's perspective), and nodes visited.
+  ! Search a FEN position to a fixed depth.
   ! Returns 0 on success, -1 on invalid FEN.
   integer(c_int) function chess_search_c(fen, depth, best_move, score, nodes) bind(C, name="chess_search")
     character(kind=c_char), dimension(*), intent(in) :: fen
@@ -567,8 +787,8 @@ contains
     logical :: ok
 
     best_move = 0_c_int32_t
-    score     = 0_c_int32_t
-    nodes     = 0_c_int64_t
+    score = 0_c_int32_t
+    nodes = 0_c_int64_t
 
     call init_search()
     call parse_fen(c_to_f(fen), p, ok)
@@ -579,8 +799,8 @@ contains
 
     call search_position(p, int(depth), info)
     best_move = info%best_move
-    score     = info%score
-    nodes     = info%nodes
+    score = info%score
+    nodes = info%nodes
     chess_search_c = 0_c_int
   end function chess_search_c
 

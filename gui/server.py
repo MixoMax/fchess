@@ -1,54 +1,26 @@
 import os
-import threading
-from ctypes import (CDLL, POINTER, c_char, c_char_p, c_int, c_int32, c_int64,
-                    create_string_buffer)
+import sys
+from dataclasses import asdict
+import time
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ENGINE_DIR = os.path.realpath(os.path.join(HERE, "..", "engine"))
 STATIC_DIR = os.path.realpath(os.path.join(HERE, "static"))
-LIB_PATH = os.path.join(HERE, "..", "engine", "bin", "libfchess.so")
 
-SEARCH_DEPTH = 7
-MAX_MOVES = 512           # matches move_list_t capacity in the engine
-MATE_THRESHOLD = 28000    # mirrors chess_search.f90
-MATE_SCORE = 29000
+if ENGINE_DIR not in sys.path:
+    sys.path.insert(0, ENGINE_DIR)
 
-if not os.path.exists(LIB_PATH):
-    raise RuntimeError(f"{LIB_PATH} not found; run `sh engine/build.sh` first")
+try:
+    from chess_binding import Board, Color, EngineError, InvalidFenError
+except FileNotFoundError as exc:
+    raise RuntimeError(
+        f"{exc}. Run `sh engine/build.sh` first, or set FCHESS_LIB."
+    ) from exc
 
-lib = CDLL(LIB_PATH)
-
-# Declare signatures so ctypes marshals arguments correctly.
-lib.chess_init.argtypes = []
-lib.chess_init.restype = None
-
-lib.chess_clear_tt.argtypes = []
-lib.chess_clear_tt.restype = None
-
-lib.chess_perft.argtypes = [c_char_p, c_int, POINTER(c_int64)]
-lib.chess_perft.restype = c_int
-
-lib.chess_legal_moves.argtypes = [c_char_p, POINTER(c_int32), c_int]
-lib.chess_legal_moves.restype = c_int
-
-lib.chess_eval.argtypes = [c_char_p, POINTER(c_int32)]
-lib.chess_eval.restype = c_int
-
-lib.chess_search.argtypes = [c_char_p, c_int, POINTER(c_int32),
-                             POINTER(c_int32), POINTER(c_int64)]
-lib.chess_search.restype = c_int
-
-lib.chess_move_uci.argtypes = [c_int32, POINTER(c_char)]
-lib.chess_move_uci.restype = None
-
-lib.chess_init()
-
-# The engine keeps global state (transposition table, lookup tables), so
-# every call into it is serialised. FastAPI runs `def` endpoints in a thread
-# pool, so this lock is what keeps concurrent requests from corrupting it.
-_engine_lock = threading.Lock()
+SEARCH_DEPTH = 16
 
 app = FastAPI()
 
@@ -69,77 +41,61 @@ def _invalid_fen(fen: str) -> HTTPException:
     return HTTPException(status_code=400, detail=f"invalid FEN: {fen}")
 
 
-def _side_to_move(fen: str) -> str:
-    parts = fen.split()
-    return parts[1] if len(parts) > 1 else "w"
+def _load_board(fen: str) -> Board:
+    """Normalise the FEN and build a Board, turning parse errors into HTTP 400s."""
+    fen = _normalise_fen(fen)
+    try:
+        return Board(fen)
+    except (InvalidFenError, ValueError):
+        raise _invalid_fen(fen)
 
 
-def _uci(move: int) -> str:
-    buf = create_string_buffer(8)
-    lib.chess_move_uci(move, buf)
-    return buf.value.decode("ascii")
-
-
-def _white_perspective(score_stm: int, fen: str) -> int:
-    # Engine scores are from the side to move; convert to White's view.
-    return score_stm if _side_to_move(fen) == "w" else -score_stm
-
-
-def _mate_in(score_stm: int) -> int | None:
-    """Return moves-to-mate from the side to move (positive = side to move mates)."""
-    if abs(score_stm) <= MATE_THRESHOLD:
-        return None
-    plies = MATE_SCORE - abs(score_stm)
-    moves = (plies + 1) // 2
-    return moves if score_stm > 0 else -moves
+def _white_perspective(score_stm: int, board: Board) -> int:
+    # The binding reports scores from the side to move; convert to White's view.
+    return score_stm if board.turn == Color.WHITE else -score_stm
 
 
 @app.get("/api/v1/legal_moves")
 def get_legal_moves(fen: str):
-    fen = _normalise_fen(fen)
-    moves = (c_int32 * MAX_MOVES)()
-    with _engine_lock:
-        n = lib.chess_legal_moves(fen.encode("ascii"), moves, MAX_MOVES)
-    if n < 0:
+    t0 = time.time()
+    board = _load_board(fen)
+    try:
+        moves = [m.uci for m in board.legal_moves()]
+    except (InvalidFenError, EngineError):
         raise _invalid_fen(fen)
-    uci = [_uci(moves[i]) for i in range(min(n, MAX_MOVES))]
-    return {"legal_moves": uci, "count": n}
+    return {"legal_moves": moves, "count": len(moves), "time": time.time() - t0}
 
 
 @app.get("/api/v1/evaluate")
 def evaluate_position(fen: str):
-    fen = _normalise_fen(fen)
-    score = c_int32(0)
-    with _engine_lock:
-        rc = lib.chess_eval(fen.encode("ascii"), score)
-    if rc != 0:
+    t0 = time.time()
+    board = _load_board(fen)
+    try:
+        cp = _white_perspective(board.evaluate(), board)
+    except (InvalidFenError, EngineError):
         raise _invalid_fen(fen)
-    cp = _white_perspective(score.value, fen)
-    return {"evaluation": cp / 100.0, "evaluation_cp": cp}
+    return {"evaluation": cp / 100.0, "evaluation_cp": cp, "time": time.time() - t0}
 
 
 @app.get("/api/v1/best_move")
 def best_move(
     fen: str,
-    depth: int = Query(SEARCH_DEPTH, ge=1, le=12),
+    depth: int = Query(SEARCH_DEPTH, ge=1, le=20),
 ):
-    fen = _normalise_fen(fen)
-    move = c_int32(0)
-    score = c_int32(0)
-    nodes = c_int64(0)
-    with _engine_lock:
-        rc = lib.chess_search(fen.encode("ascii"), depth,
-                              move, score, nodes)
-    if rc != 0:
+    t0 = time.time()
+    board = _load_board(fen)
+    try:
+        result = board.search(depth)
+    except (InvalidFenError, EngineError):
         raise _invalid_fen(fen)
 
-    stm_score = score.value
     return {
-        "best_move": _uci(move.value) if move.value != 0 else None,
+        "best_move": result.best_move.uci if result.best_move else None,
         "depth": depth,
-        "score_cp": _white_perspective(stm_score, fen),
-        "mate_in": _mate_in(stm_score),
-        "nodes": nodes.value,
+        "score_cp": _white_perspective(result.score, board),
+        "mate_in": result.mate_in,  # from the side to move's perspective
+        "nodes": result.nodes,
+        "time": time.time() - t0,
     }
 
 
@@ -148,14 +104,13 @@ def perft(
     fen: str,
     plies: int = Query(..., ge=1, le=6),
 ):
-    fen = _normalise_fen(fen)
-    counts = (c_int64 * 6)()
-    with _engine_lock:
-        rc = lib.chess_perft(fen.encode("ascii"), plies, counts)
-    if rc != 0:
+    t0 = time.time()
+    board = _load_board(fen)
+    try:
+        counts = board.perft(plies)
+    except (InvalidFenError, EngineError):
         raise _invalid_fen(fen)
-    keys = ["nodes", "captures", "en_passant", "castles", "promotions", "checks"]
-    return {"plies": plies, **dict(zip(keys, (int(c) for c in counts)))}
+    return {"plies": plies, **asdict(counts), "time": time.time() - t0}
 
 
 @app.get("/{path:path}")

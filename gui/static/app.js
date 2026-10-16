@@ -402,7 +402,9 @@ async function engineMove(gen) {
     pushHistory();
     applyLocal(data.best_move);
 
-    let info = `Engine: depth ${data.depth}, ${data.nodes.toLocaleString()} nodes`;
+    let nps = data.nodes / Math.max(data.time, 0.001);
+    let nps_fmt = nps >= 1e6 ? `${(nps / 1e6).toFixed(2)}M` : nps >= 1e3 ? `${(nps / 1e3).toFixed(2)}k` : `${Math.round(nps)}`;
+    let info = `Engine: depth ${data.depth}, ${data.nodes.toLocaleString()} nodes in ${data.time.toFixed(2)}s (${nps_fmt}/s)`;
     if (data.mate_in !== null && data.mate_in !== undefined) {
         info += data.mate_in > 0
             ? `, mate in ${data.mate_in}`
